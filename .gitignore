@@ -1,0 +1,6 @@
+# Config values
+.env
+
+# API tokens
+.cache
+oauth.json
