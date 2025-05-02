@@ -1,4 +1,4 @@
-# Hello there
+# ![Hello there](https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExazlkc21vZng4MnhzZGw5bmtkbWNrcGFvem5mcDd6dzN4N2cwN203byZlcD12MV9naWZzX3NlYXJjaCZjdD1n/xTiIzJSKB4l7xTouE8/giphy.gif)
 `playlist-import.py` is a Python script used to import Spotify playlists to Youtube Music. The current iteration only imports user-created playlists.
 
 ## Pre-requisites
