@@ -4,3 +4,4 @@
 # API tokens
 .cache
 oauth.json
+browser.json
