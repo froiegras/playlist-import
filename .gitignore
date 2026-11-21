@@ -5,3 +5,4 @@
 .cache
 oauth.json
 browser.json
+sync_state.json

@@ -73,3 +73,13 @@ Copy uri that opens in browser and enter in terminal
 .cache should have been generated
 ```
 
+## Two-way sync between your own Spotify and YouTube Music playlists.
+
+- Playlists are matched by name (case-insensitive).
+- Playlists that exist on only one side are created on the other.
+- Tracks missing on either side are added (additive only: nothing is deleted).
+- Only playlists YOU own are touched on both services.
+
+Usage:
+    python sync_playlists.py --dry-run   # show what would change
+    python sync_playlists.py             # actually sync
