@@ -1,4 +1,5 @@
 import argparse
+import html
 import json
 import os
 import re
@@ -44,6 +45,7 @@ sp = get_spotify()
 ytmusic = YTMusic(YT_MUSIC_HEADER_AUTH_JSON)
 SP_USER_ID = sp.current_user()["id"]
 
+
 def load_state():
     if STATE_FILE.exists():
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -53,6 +55,7 @@ def load_state():
     state.setdefault("yt_to_sp", {})
     state.setdefault("not_found_on_yt", [])
     state.setdefault("not_found_on_sp", [])
+    state.setdefault("descriptions", {})
     return state
 
 
@@ -72,6 +75,21 @@ def norm(s):
 
 def make_key(title, artist):
     return f"{norm(title)}|{norm(artist)}"
+
+PLACEHOLDER_DESCRIPTIONS = {"imported from spotify", "synced from spotify", "synced from youtube music"}
+SP_DESC_LIMIT = 300
+
+
+def clean_desc(d):
+    """Strip HTML (Spotify returns links/entities) and ignore our own placeholders."""
+    d = re.sub(r"<[^>]+>", "", d or "")
+    d = html.unescape(d).strip()
+    return "" if d.lower() in PLACEHOLDER_DESCRIPTIONS else d
+
+
+def desc_equal(a, b):
+    """Compare descriptions, tolerating Spotify's length limit."""
+    return (a or "")[:SP_DESC_LIMIT] == (b or "")[:SP_DESC_LIMIT]
 
 
 def make_track(track_id, title, artist):
@@ -99,7 +117,7 @@ def get_spotify_playlists(excluded=frozenset()):
     """name(lower) -> {'id', 'name'} for playlists owned by the current user."""
     playlists = sp_paginate(sp.current_user_playlists(limit=50))
     return {
-        p["name"].lower(): {"id": p["id"], "name": p["name"]}
+        p["name"].lower(): {"id": p["id"], "name": p["name"], "description": p.get("description")}
         for p in playlists
         if p and p["owner"]["id"] == SP_USER_ID and p["name"].lower() not in excluded
     }
@@ -130,8 +148,8 @@ def find_on_spotify(track):
     return None
 
 
-def create_spotify_playlist(name):
-    pl = sp.user_playlist_create(SP_USER_ID, name, public=False, description="")
+def create_spotify_playlist(name, description=""):
+    pl = sp.user_playlist_create(SP_USER_ID, name, public=False, description=description[:SP_DESC_LIMIT])
     return pl["id"]
 
 
@@ -168,7 +186,10 @@ def get_ytmusic_playlists(excluded=frozenset()):
                 continue
             artist = t["artists"][0]["name"] if t.get("artists") else ""
             tracks.append(make_track(t["videoId"], t["title"], artist))
-        result[p["title"].lower()] = {"id": pid, "name": p["title"], "tracks": dedupe(tracks)}
+        result[p["title"].lower()] = {
+            "id": pid, "name": p["title"], "tracks": dedupe(tracks),
+            "description": data.get("description"),
+        }
     return result
 
 
@@ -183,13 +204,13 @@ def find_on_youtube(track):
     return results[0].get("videoId")
 
 
-def create_ytmusic_playlist(name):
+def create_ytmusic_playlist(name, description=""):
     try:
-        return ytmusic.create_playlist(name, "", privacy_status="PRIVATE")
+        return ytmusic.create_playlist(name, description, privacy_status="PRIVATE")
     except Exception as e:
         print(f"  Error creating playlist (retrying with sanitized name): {e}")
         sanitized = re.sub(r"[<>]", "", name).strip() or "Imported Playlist"
-        return ytmusic.create_playlist(sanitized, "", privacy_status="PRIVATE")
+        return ytmusic.create_playlist(sanitized, description, privacy_status="PRIVATE")
 
 
 def add_to_ytmusic(playlist_id, video_ids):
@@ -243,14 +264,18 @@ def resolve(missing, finder, state, forward_map, backward_map, not_found_list, t
 def sync_playlist(name, sp_pl, yt_pl, state, dry_run):
     if sp_pl is None:
         print("  Playlist only on YouTube Music -> creating on Spotify")
-        sp_pl = {"id": None if dry_run else create_spotify_playlist(name), "name": name}
+        desc = clean_desc(yt_pl.get("description"))
+        sp_pl = {"id": None if dry_run else create_spotify_playlist(name, desc),
+                 "name": name, "description": desc[:SP_DESC_LIMIT]}
         sp_tracks = []
     else:
         sp_tracks = get_spotify_tracks(sp_pl["id"])
 
     if yt_pl is None:
         print("  Playlist only on Spotify -> creating on YouTube Music")
-        yt_pl = {"id": None if dry_run else create_ytmusic_playlist(name), "name": name, "tracks": []}
+        desc = clean_desc(sp_pl.get("description"))
+        yt_pl = {"id": None if dry_run else create_ytmusic_playlist(name, desc),
+                 "name": name, "tracks": [], "description": desc}
     yt_tracks = yt_pl["tracks"]
 
     print(f"  Spotify: {len(sp_tracks)} tracks | YouTube Music: {len(yt_tracks)} tracks")
@@ -275,7 +300,49 @@ def sync_playlist(name, sp_pl, yt_pl, state, dry_run):
         print(f"  {'Would add' if dry_run else 'Added'} {len(spotify_ids)} to Spotify")
 
     if not add_to_yt and not add_to_sp:
-        print("  Already in sync")
+        print("  Tracks already in sync")
+
+    sync_description(name, sp_pl, yt_pl, state, dry_run)
+
+
+def sync_description(name, sp_pl, yt_pl, state, dry_run):
+    """
+    Keep playlist descriptions in sync.
+    - One side empty      -> copy from the other side.
+    - Both set, differ    -> whichever side changed since the last sync wins.
+    - Both changed / no history -> Spotify wins.
+    """
+    key = name.lower()
+    sp_d = clean_desc(sp_pl.get("description"))
+    yt_d = clean_desc(yt_pl.get("description"))
+    last = state["descriptions"].get(key)
+
+    if desc_equal(sp_d, yt_d):
+        state["descriptions"][key] = yt_d if len(yt_d) > len(sp_d) else sp_d
+        return
+
+    if not yt_d:
+        direction = "sp_to_yt"
+    elif not sp_d:
+        direction = "yt_to_sp"
+    elif last is not None and desc_equal(yt_d, last) and not desc_equal(sp_d, last):
+        direction = "sp_to_yt"
+    elif last is not None and desc_equal(sp_d, last) and not desc_equal(yt_d, last):
+        direction = "yt_to_sp"
+    else:
+        print("  Description differs on both sides -> using Spotify's")
+        direction = "sp_to_yt"
+
+    if direction == "sp_to_yt":
+        print(f"  {'Would update' if dry_run else 'Updating'} YouTube Music description")
+        if not dry_run and yt_pl["id"]:
+            ytmusic.edit_playlist(yt_pl["id"], description=sp_d)
+        state["descriptions"][key] = sp_d
+    else:
+        print(f"  {'Would update' if dry_run else 'Updating'} Spotify description")
+        if not dry_run and sp_pl["id"]:
+            sp.playlist_change_details(sp_pl["id"], description=yt_d[:SP_DESC_LIMIT])
+        state["descriptions"][key] = yt_d
 
 
 def main():
