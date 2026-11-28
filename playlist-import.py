@@ -3,12 +3,14 @@ import html
 import json
 import os
 import re
+import requests
 from pathlib import Path
 
 import spotipy
 from dotenv import load_dotenv
 from spotipy.oauth2 import SpotifyOAuth
 from ytmusicapi import YTMusic
+from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -18,6 +20,7 @@ SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
 SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN")
 YT_MUSIC_HEADER_AUTH_JSON = os.getenv("YT_MUSIC_HEADER_AUTH_JSON")
 
+WEBHOOK_URL = os.getenv("SYNC_WEBHOOK_URL")
 EXCLUDED_PLAYLISTS = os.getenv("EXCLUDED_PLAYLISTS", "")
 
 SCOPE = (
@@ -344,6 +347,39 @@ def sync_description(name, sp_pl, yt_pl, state, dry_run):
             sp.playlist_change_details(sp_pl["id"], description=yt_d[:SP_DESC_LIMIT])
         state["descriptions"][key] = yt_d
 
+def send_report(results: dict, errors: list):
+    """ results: {"Playlist name": ["Artist - Title", ...]}, the new songs added to each playlist """
+    if not WEBHOOK_URL:
+        return
+
+    total = sum(len(songs) for songs in results.values())
+    sections = []
+    for playlist, songs in results.items():
+        if songs:
+            shown = "\n".join(f"• {s}" for s in songs[:10])
+            more = f"\n…and {len(songs) - 10} more" if len(songs) > 10 else ""
+            sections.append(f"**{playlist}** (+{len(songs)})\n{shown}{more}")
+        else:
+            sections.append(f"**{playlist}**: up to date")
+
+    embed = {
+        "title": f"🔄 Playlist sync: {total} new song{'s' if total != 1 else ''}",
+        "description": ("\n\n".join(sections) or "Nothing was synced.")[:4000],
+        "color": 0xE74C3C if errors else (0x2ECC71 if total else 0x95A5A6),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if errors:
+        embed["fields"] = [{"name": "⚠️ Errors", "value": "\n".join(errors)[:1000]}]
+
+    payload = {
+        "username": "Playlist Sync",
+        "embeds": [embed],
+        "allowed_mentions": {"parse": []},
+    }
+    try:
+        requests.post(WEBHOOK_URL, json=payload, timeout=10).raise_for_status()
+    except requests.RequestException as e:
+        print(f"Couldn't send Discord report: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Two-way Spotify <-> YouTube Music playlist sync")
@@ -382,4 +418,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    results, errors = {}, []
+    try:
+        results = main()
+    except Exception as e:
+        errors.append(f"{type(e).__name__}: {e}")
+    send_report(results, errors)
