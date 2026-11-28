@@ -3,14 +3,16 @@ import html
 import json
 import os
 import re
-import requests
+import sys
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 import spotipy
 from dotenv import load_dotenv
 from spotipy.oauth2 import SpotifyOAuth
 from ytmusicapi import YTMusic
-from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -31,6 +33,14 @@ SCOPE = (
 STATE_FILE = Path("sync_state.json")
 BATCH = 100
 
+# Clients are created in init_clients(), inside main()'s error handling, so a
+# login failure (expired token / cookies) gets reported to Discord instead of
+# crashing before the report code can run.
+sp = None
+ytmusic = None
+SP_USER_ID = None
+
+
 def get_spotify():
     auth = SpotifyOAuth(
         client_id=SPOTIFY_CLIENT_ID,
@@ -44,9 +54,11 @@ def get_spotify():
     return spotipy.Spotify(auth_manager=auth)
 
 
-sp = get_spotify()
-ytmusic = YTMusic(YT_MUSIC_HEADER_AUTH_JSON)
-SP_USER_ID = sp.current_user()["id"]
+def init_clients():
+    global sp, ytmusic, SP_USER_ID
+    sp = get_spotify()
+    ytmusic = YTMusic(YT_MUSIC_HEADER_AUTH_JSON)
+    SP_USER_ID = sp.current_user()["id"]
 
 
 def load_state():
@@ -117,7 +129,7 @@ def sp_paginate(results):
 
 
 def get_spotify_playlists(excluded=frozenset()):
-    """name(lower) -> {'id', 'name'} for playlists owned by the current user."""
+    """name(lower) -> {'id', 'name', 'description'} for playlists owned by the current user."""
     playlists = sp_paginate(sp.current_user_playlists(limit=50))
     return {
         p["name"].lower(): {"id": p["id"], "name": p["name"], "description": p.get("description")}
@@ -162,7 +174,7 @@ def add_to_spotify(playlist_id, track_ids):
 
 
 def get_ytmusic_playlists(excluded=frozenset()):
-    """name(lower) -> {'id', 'name', 'tracks'} for playlists owned by the user."""
+    """name(lower) -> {'id', 'name', 'tracks', 'description'} for playlists owned by the user."""
     result = {}
     try:
         library = ytmusic.get_library_playlists(limit=None) or []
@@ -237,13 +249,14 @@ def tracks_to_add(source, target, id_map, not_found):
 
 
 def resolve(missing, finder, state, forward_map, backward_map, not_found_list, target_ids):
-    """Search the other service for each missing track. Returns list of found ids.
+    """Search the other service for each missing track.
 
-    If the search lands on a track that is already in the target playlist (e.g. the
-    title/artist text differs between services, as with romanized vs. native names),
-    we record the match but don't add a duplicate.
+    Returns a dict {id on the other service: "Artist - Title"} for tracks that
+    should actually be added. If the search lands on a track that is already in
+    the target playlist (e.g. romanized vs. native names), the match is recorded
+    but nothing is added.
     """
-    found = []
+    found = {}
     for i, t in enumerate(missing, 1):
         print(f"    Searching {i}/{len(missing)}: {t['title']} - {t['artist']}")
         try:
@@ -255,16 +268,19 @@ def resolve(missing, finder, state, forward_map, backward_map, not_found_list, t
             state[forward_map][t["id"]] = other_id
             state[backward_map][other_id] = t["id"]
             if other_id not in target_ids:
-                found.append(other_id)
+                found.setdefault(other_id, f"{t['artist']} - {t['title']}")
             else:
                 print("      Already in target playlist under a different name, skipping")
         else:
             not_found_list.append(t["key"])
             print("      Not found")
-    return list(dict.fromkeys(found))
+    return found
 
 
 def sync_playlist(name, sp_pl, yt_pl, state, dry_run):
+    """Sync one playlist. Returns a list of labels for the songs that were added."""
+    added = []
+
     if sp_pl is None:
         print("  Playlist only on YouTube Music -> creating on Spotify")
         desc = clean_desc(yt_pl.get("description"))
@@ -288,24 +304,29 @@ def sync_playlist(name, sp_pl, yt_pl, state, dry_run):
 
     if add_to_yt:
         print(f"  {len(add_to_yt)} track(s) to add to YouTube Music")
-        video_ids = resolve(add_to_yt, find_on_youtube, state, "sp_to_yt", "yt_to_sp",
-                            state["not_found_on_yt"], {t["id"] for t in yt_tracks})
+        found = resolve(add_to_yt, find_on_youtube, state, "sp_to_yt", "yt_to_sp",
+                        state["not_found_on_yt"], {t["id"] for t in yt_tracks})
+        video_ids = list(found)
         if video_ids and not dry_run:
             add_to_ytmusic(yt_pl["id"], video_ids)
+        added += [f"{label} (→ YT Music)" for label in found.values()]
         print(f"  {'Would add' if dry_run else 'Added'} {len(video_ids)} to YouTube Music")
 
     if add_to_sp:
         print(f"  {len(add_to_sp)} track(s) to add to Spotify")
-        spotify_ids = resolve(add_to_sp, find_on_spotify, state, "yt_to_sp", "sp_to_yt",
-                              state["not_found_on_sp"], {t["id"] for t in sp_tracks})
+        found = resolve(add_to_sp, find_on_spotify, state, "yt_to_sp", "sp_to_yt",
+                        state["not_found_on_sp"], {t["id"] for t in sp_tracks})
+        spotify_ids = list(found)
         if spotify_ids and not dry_run:
             add_to_spotify(sp_pl["id"], spotify_ids)
+        added += [f"{label} (→ Spotify)" for label in found.values()]
         print(f"  {'Would add' if dry_run else 'Added'} {len(spotify_ids)} to Spotify")
 
     if not add_to_yt and not add_to_sp:
         print("  Tracks already in sync")
 
     sync_description(name, sp_pl, yt_pl, state, dry_run)
+    return added
 
 
 def sync_description(name, sp_pl, yt_pl, state, dry_run):
@@ -347,24 +368,26 @@ def sync_description(name, sp_pl, yt_pl, state, dry_run):
             sp.playlist_change_details(sp_pl["id"], description=yt_d[:SP_DESC_LIMIT])
         state["descriptions"][key] = yt_d
 
-def send_report(results: dict, errors: list):
-    """ results: {"Playlist name": ["Artist - Title", ...]}, the new songs added to each playlist """
+
+def send_report(results, errors):
+    """results: {"Playlist name": ["Artist - Title (→ Service)", ...]}"""
     if not WEBHOOK_URL:
         return
+    results = results or {}
+    errors = errors or []
 
     total = sum(len(songs) for songs in results.values())
     sections = []
     for playlist, songs in results.items():
-        if songs:
-            shown = "\n".join(f"• {s}" for s in songs[:10])
-            more = f"\n…and {len(songs) - 10} more" if len(songs) > 10 else ""
-            sections.append(f"**{playlist}** (+{len(songs)})\n{shown}{more}")
-        else:
-            sections.append(f"**{playlist}**: up to date")
+        if not songs:
+            continue
+        shown = "\n".join(f"• {s}" for s in songs[:10])
+        more = f"\n…and {len(songs) - 10} more" if len(songs) > 10 else ""
+        sections.append(f"**{playlist}** (+{len(songs)})\n{shown}{more}")
 
     embed = {
         "title": f"🔄 Playlist sync: {total} new song{'s' if total != 1 else ''}",
-        "description": ("\n\n".join(sections) or "Nothing was synced.")[:4000],
+        "description": ("\n\n".join(sections) or "Everything is up to date.")[:4000],
         "color": 0xE74C3C if errors else (0x2ECC71 if total else 0x95A5A6),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -381,6 +404,7 @@ def send_report(results: dict, errors: list):
     except requests.RequestException as e:
         print(f"Couldn't send Discord report: {e}")
 
+
 def main():
     parser = argparse.ArgumentParser(description="Two-way Spotify <-> YouTube Music playlist sync")
     parser.add_argument("--dry-run", action="store_true", help="show changes without making them")
@@ -393,34 +417,43 @@ def main():
     if excluded:
         print(f"Excluding {len(excluded)} playlist name(s): {', '.join(sorted(excluded))}")
 
+    results, errors = {}, []
     state = load_state()
-    sp_playlists = get_spotify_playlists(excluded)
-    yt_playlists = get_ytmusic_playlists(excluded)
 
-    names = sorted(set(sp_playlists) | set(yt_playlists))
-    print(f"Spotify: {len(sp_playlists)} playlists | YouTube Music: {len(yt_playlists)} playlists")
-    print(f"{len(names)} unique playlist names to process{' (DRY RUN)' if args.dry_run else ''}\n")
+    try:
+        init_clients()
+        sp_playlists = get_spotify_playlists(excluded)
+        yt_playlists = get_ytmusic_playlists(excluded)
 
-    for key in names:
-        sp_pl = sp_playlists.get(key)
-        yt_pl = yt_playlists.get(key)
-        display = (sp_pl or yt_pl)["name"]
+        names = sorted(set(sp_playlists) | set(yt_playlists))
+        print(f"Spotify: {len(sp_playlists)} playlists | YouTube Music: {len(yt_playlists)} playlists")
+        print(f"{len(names)} unique playlist names to process{' (DRY RUN)' if args.dry_run else ''}\n")
 
-        print(f"▶️  {display}")
-        try:
-            sync_playlist(display, sp_pl, yt_pl, state, args.dry_run)
-            print("✅ Done\n")
-        except Exception as e:
-            print(f"❌ Failed: {e}\n")
-        finally:
-            if not args.dry_run:
-                save_state(state)
+        for key in names:
+            sp_pl = sp_playlists.get(key)
+            yt_pl = yt_playlists.get(key)
+            display = (sp_pl or yt_pl)["name"]
+
+            print(f"▶️  {display}")
+            try:
+                results[display] = sync_playlist(display, sp_pl, yt_pl, state, args.dry_run)
+                print("✅ Done\n")
+            except Exception as e:
+                print(f"❌ Failed: {e}\n")
+                traceback.print_exc()
+                errors.append(f"{display}: {type(e).__name__}: {e}")
+            finally:
+                if not args.dry_run:
+                    save_state(state)
+    except Exception as e:
+        traceback.print_exc()
+        errors.append(f"{type(e).__name__}: {e}")
+
+    if not args.dry_run:
+        send_report(results, errors)
+
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
-    results, errors = {}, []
-    try:
-        results = main()
-    except Exception as e:
-        errors.append(f"{type(e).__name__}: {e}")
-    send_report(results, errors)
+    sys.exit(main())
